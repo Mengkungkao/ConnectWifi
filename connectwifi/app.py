@@ -55,6 +55,7 @@ class ConnectWifiApp:
         self.busy = False
 
         self.networks: list[network.Network] = []
+        self.saved: dict[str, network.SavedNetwork] = {}
         self.scan_index = 0
         self.scan_window = 0
         self.scan_wide = False
@@ -251,9 +252,14 @@ class ConnectWifiApp:
             self._spawn(lambda: self._scan(wide=True))
             return
         chosen = self.networks[position]
+        if chosen.active:
+            self.status_line = f"Already on {chosen.ssid}"
+            return
         self.ssid_buffer = chosen.ssid
         self.password_buffer = ""
-        if chosen.is_open:
+        # A network joined before comes up on its saved password; the
+        # password field appears only if that one is refused.
+        if chosen.saved or chosen.is_open:
             self._start_connect(chosen.ssid, "")
             return
         self.password_return = MODE_SCAN
@@ -270,7 +276,7 @@ class ConnectWifiApp:
         if self.mode == MODE_PASSWORD:
             self.password_buffer = ""
             self.mode = self.password_return
-            self.status_line = "" if self.mode == MODE_SCAN else "Type the network name"
+            self.status_line = "Type the network name" if self.mode == MODE_SSID else ""
             return
         self.mode = MODE_SCAN if self.networks else MODE_MENU
         self.ssid_buffer = ""
@@ -288,6 +294,9 @@ class ConnectWifiApp:
             if not self.ssid_buffer.strip():
                 self.status_line = "SSID cannot be empty"
                 return
+            if self.ssid_buffer.strip() in self.saved:
+                self._start_connect(self.ssid_buffer.strip(), "")
+                return
             self.mode = MODE_PASSWORD
             self.password_return = MODE_SSID
             self.password_known_secured = False
@@ -295,9 +304,9 @@ class ConnectWifiApp:
             self.status_line = "Blank = open network"
             return
         ssid = self.ssid_buffer.strip()
-        # A blank password is allowed: it reconnects a network NetworkManager
-        # already has a profile for. A short one can only fail, and nmcli
-        # takes a while to say so, so catch it here. WEP keys are shorter.
+        # A blank password is allowed: it retries the saved one, or joins an
+        # open network. A short one can only fail, and nmcli takes a while
+        # to say so, so catch it here. WEP keys are shorter.
         if 0 < len(self.password_buffer) < WPA_MIN_LEN and "wep" not in self._security_of(ssid).lower():
             self.status_line = f"Password needs {WPA_MIN_LEN}+ characters"
             return
@@ -353,6 +362,21 @@ class ConnectWifiApp:
             return self._list("yes", timeout=45)
         return self._list("no", timeout=20)
 
+    def _profile_uuids(self) -> list[str]:
+        return network.wifi_profile_uuids(output_of(
+            self.commands.run(["nmcli", "-t", "-f", "UUID,TYPE", "connection", "show"], timeout=10)
+        ))
+
+    def _load_saved(self, uuids: list[str] | None = None) -> dict[str, network.SavedNetwork]:
+        """Saved Wi-Fi profiles by SSID. Reading them needs no privilege;
+        their passwords stay hidden, and the app never needs to see them."""
+        uuids = self._profile_uuids() if uuids is None else uuids
+        if not uuids:
+            return {}
+        return network.parse_profiles(output_of(
+            self.commands.run(network.profiles_command(uuids), timeout=10)
+        ))
+
     def _scan(self, wide: bool):
         """Two tiers. The first pass reads NetworkManager's cached scan: no
         radio sweep, so it costs no power and lands instantly, then keeps only
@@ -368,8 +392,12 @@ class ConnectWifiApp:
             if not any(not n.active for n in found):
                 wide = True
                 found = self._sweep()
+        saved = self._load_saved()
+        for found_network in found:
+            found_network.saved = found_network.ssid in saved
 
         with self.lock:
+            self.saved = saved
             self.networks = found
             self.scan_wide = wide
             if found:
@@ -396,11 +424,31 @@ class ConnectWifiApp:
         return network.ssid_listed(result.stdout, ssid)
 
     def _connect(self, ssid: str, password: str):
-        args = network.connect_command(ssid, password, self.device, hidden=not self._ssid_visible(ssid))
-        result = self.commands.run_privileged(args, timeout=90)
+        """A saved network comes up on its own profile, with a newly typed
+        password written into it first. Anything else goes through
+        `nmcli device wifi connect`, which makes a profile for it. A refused
+        password leads back to the password field rather than a dead end."""
+        before = self._profile_uuids()
+        profile = self._load_saved(before).get(ssid)
+        result = None
+        if profile is not None:
+            if password:
+                result = self.commands.run_privileged(
+                    network.set_password_command(profile.uuid, password), timeout=15)
+            if result is None or result.returncode == 0:
+                result = self.commands.run_privileged(network.up_command(profile.uuid, self.device), timeout=90)
+        else:
+            args = network.connect_command(ssid, password, self.device, hidden=not self._ssid_visible(ssid))
+            result = self.commands.run_privileged(args, timeout=90)
         ok = result.returncode == 0
         message = (result.stdout if ok else (result.stderr or result.stdout)).strip()
+        if not ok and profile is None:
+            self._forget_failed_profile(ssid, before)
+        refused = not ok and network.is_auth_failure(message)
         with self.lock:
+            if refused:
+                self._ask_password_again(ssid, tried_one=bool(password) or profile is not None)
+                return
             self.result_ok = ok
             self.result_message = (message if ok else self.commands.short_error(message or "Failed")) \
                 or ("Connected" if ok else "Failed")
@@ -408,6 +456,24 @@ class ConnectWifiApp:
             self.status_line = ""
             if ok:
                 self.ssid_buffer = ""
+
+    def _forget_failed_profile(self, ssid: str, before: list[str]):
+        """`nmcli device wifi connect` can leave the profile it made behind
+        even when joining failed. With a wrong password in it, NetworkManager
+        would keep trying it on its own, and the list would call the network
+        saved. Delete what this attempt created."""
+        created = [uuid for uuid in self._profile_uuids() if uuid not in before]
+        for made in self._load_saved(created).values() if created else ():
+            if made.ssid == ssid:
+                self.commands.run_privileged(network.delete_command(made.uuid), timeout=15)
+
+    def _ask_password_again(self, ssid: str, tried_one: bool):
+        self.mode = MODE_PASSWORD
+        self.ssid_buffer = ssid
+        self.password_buffer = ""
+        self.password_known_secured = True
+        self.password_return = MODE_SCAN if self.networks else MODE_MENU
+        self.status_line = "Wrong password - type it again" if tried_one else "This network needs a password"
 
     # ---------- status ----------
 
@@ -459,7 +525,7 @@ class ConnectWifiApp:
                 scan_index=self.scan_index,
                 scan_window=self.scan_window,
                 scan_wide=self.scan_wide,
-                networks=tuple((n.ssid, n.signal, n.active, n.is_open) for n in self.networks),
+                networks=tuple((n.ssid, n.signal, n.active, n.is_open, n.saved) for n in self.networks),
                 connect_ssid=self.connect_ssid,
                 result_ok=self.result_ok,
                 result_message=self.result_message,

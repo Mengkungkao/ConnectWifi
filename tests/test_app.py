@@ -2,6 +2,7 @@ import pytest
 from conftest import FakeRunner, done
 
 from connectwifi import app as appmod
+from connectwifi import network
 from connectwifi.screens import (
     MENU_EXIT, MENU_SCAN, MENU_TOGGLE_BLE, MODE_CONNECTING, MODE_MENU, MODE_PASSWORD,
     MODE_RESULT, MODE_SCAN, MODE_SSID, VISIBLE_SCAN_ROWS,
@@ -47,8 +48,45 @@ def is_list(rescan, fields="IN-USE,SSID,SIGNAL,SECURITY"):
     return lambda a: a[:2] != ["sudo", "-n"] and "list" in a and fields in a and a[-1] == rescan
 
 
-def fake_nm(cached=CACHED, swept=SWEPT, scan="yes", ble=BLE_OFF):
-    return FakeRunner(
+SECRETS = done(returncode=4, stderr="Error: Connection activation failed: (7) Secrets were required, "
+                                     "but not provided.\n")
+
+
+class Profiles:
+    """NetworkManager's saved Wi-Fi profiles, as the fake nmcli sees them."""
+
+    def __init__(self, *entries):
+        # (ssid, uuid, last used)
+        self.entries = {uuid: (ssid, last_used) for ssid, uuid, last_used in entries}
+
+    def add(self, ssid, uuid, last_used=0):
+        self.entries[uuid] = (ssid, last_used)
+
+    def listing(self, args):
+        lines = [f"{uuid}:802-11-wireless" for uuid in self.entries] + ["e0225329:loopback"]
+        return done("\n".join(lines) + "\n")
+
+    def details(self, args):
+        wanted = args[args.index("show") + 1:]
+        if any(uuid not in self.entries for uuid in wanted):
+            return done(returncode=10, stderr="Error: no such connection profile.\n")
+        blocks = [f"connection.id:{self.entries[u][0]}\nconnection.uuid:{u}\n"
+                  f"connection.timestamp:{self.entries[u][1]}\n802-11-wireless.ssid:{self.entries[u][0]}"
+                  for u in wanted]
+        return done("\n\n".join(blocks) + "\n")
+
+    def delete(self, args):
+        self.entries.pop(args[-1], None)
+        return done(f"Connection successfully deleted.\n")
+
+
+def is_nmcli(*words):
+    return lambda a: a[:1] == ["nmcli"] and list(a[1:1 + len(words)]) == list(words)
+
+
+def fake_nm(cached=CACHED, swept=SWEPT, scan="yes", ble=BLE_OFF, profiles=None):
+    profiles = profiles if profiles is not None else Profiles()
+    runner = FakeRunner(
         (lambda a: a == ["sudo", "-n", "true"], done(returncode=1, stderr="sudo: a password is required")),
         (lambda a: a[:2] == ["systemctl", "show"], done(ble)),
         (lambda a: "DEVICE,TYPE" in a, done("lo:loopback\np2p-dev-wlan0:wifi-p2p\nwlan0:wifi\n")),
@@ -59,7 +97,14 @@ def fake_nm(cached=CACHED, swept=SWEPT, scan="yes", ble=BLE_OFF):
         (is_list("no", "ACTIVE,SSID"), done("yes:Home\nno:Cafe\n")),
         (lambda a: "IP4.ADDRESS" in a, done("IP4.ADDRESS[1]:192.168.0.130/24\n")),
         (lambda a: "connect" in a, done("Device 'wlan0' successfully activated with 'abc'.\n")),
+        (lambda a: "UUID,TYPE" in a, profiles.listing),
+        (lambda a: network.PROFILE_FIELDS in a, profiles.details),
+        (is_nmcli("connection", "up"), done("Connection successfully activated.\n")),
+        (is_nmcli("connection", "modify"), done()),
+        (is_nmcli("connection", "delete"), profiles.delete),
     )
+    runner.profiles = profiles
+    return runner
 
 
 def make_app(runner=None, keyboards=("/dev/input/event1",)):
@@ -176,12 +221,114 @@ def test_a_wpa_password_under_8_characters_is_caught_before_nmcli():
     assert not runner.calls_with("connect")
 
 
-def test_a_blank_password_reuses_a_saved_profile():
-    app, runner, _ = make_app()
+def test_a_blank_password_on_an_unknown_secured_network_asks_for_one():
+    runner = fake_nm()
+    runner.add(lambda a: "connect" in a, SECRETS)
+    app, _, _ = make_app(runner)
     open_scan(app)
     select_network(app, "Office")
     app.handle_key("submit")
     assert "password" not in runner.calls_with("connect")[-1]
+    assert app.mode == MODE_PASSWORD and app.status_line == "This network needs a password"
+
+
+def test_saved_networks_are_marked_and_join_without_the_password():
+    app, runner, _ = make_app(fake_nm(profiles=Profiles(("Office", "u-office", 1790000000))))
+    open_scan(app)
+    assert [(n.ssid, n.saved) for n in app.networks] == [("Home", False), ("Cafe", False), ("Office", True)]
+    select_network(app, "Office")
+    assert runner.calls_with("connection", "up")[-1] == ["nmcli", "connection", "up", "uuid", "u-office",
+                                                        "ifname", "wlan0"]
+    assert not runner.calls_with("modify") and not runner.calls_with("connect")
+    assert app.mode == MODE_RESULT and app.result_ok
+
+
+def test_a_refused_saved_password_asks_again_then_fixes_the_profile():
+    runner = fake_nm(profiles=Profiles(("Office", "u-office", 1790000000)))
+    runner.add(is_nmcli("connection", "up"), SECRETS)
+    app, _, _ = make_app(runner)
+    open_scan(app)
+    select_network(app, "Office")
+    assert app.mode == MODE_PASSWORD and app.ssid_buffer == "Office"
+    assert app.status_line == "Wrong password - type it again" and app.password_known_secured
+
+    runner.add(is_nmcli("connection", "up"), done("Connection successfully activated.\n"))
+    type_text(app, "newpass99")
+    app.handle_key("submit")
+    modify, up = runner.calls_with("modify")[-1], runner.calls_with("connection", "up")[-1]
+    assert modify == ["nmcli", "connection", "modify", "uuid", "u-office",
+                      "802-11-wireless-security.psk", "newpass99"]
+    assert runner.calls.index(modify) < len(runner.calls) - 1 and up[4] == "u-office"
+    assert not runner.calls_with("connect")          # the same profile, no duplicate
+    assert app.mode == MODE_RESULT and app.result_ok
+
+
+def test_a_wrong_password_for_a_new_network_asks_again_and_leaves_no_profile():
+    runner = fake_nm()
+
+    def refuse_but_leave_a_profile(args):
+        runner.profiles.add("Office", "u-new")
+        return SECRETS
+
+    runner.add(lambda a: "connect" in a, refuse_but_leave_a_profile)
+    app, _, _ = make_app(runner)
+    open_scan(app)
+    select_network(app, "Office")
+    type_text(app, "wrongpass")
+    app.handle_key("submit")
+    assert app.mode == MODE_PASSWORD and app.status_line == "Wrong password - type it again"
+    assert runner.calls_with("connection", "delete")[-1][-1] == "u-new"
+    assert runner.profiles.entries == {}
+
+    runner.add(lambda a: "connect" in a, done("Device 'wlan0' successfully activated.\n"))
+    type_text(app, "rightpass")
+    app.handle_key("submit")
+    assert runner.calls_with("connect")[-1][4:7] == ["Office", "password", "rightpass"]
+    assert app.mode == MODE_RESULT and app.result_ok
+
+
+def test_a_saved_network_out_of_range_says_so_instead_of_asking():
+    runner = fake_nm(profiles=Profiles(("Office", "u-office", 1)))
+    runner.add(is_nmcli("connection", "up"),
+               done(returncode=4, stderr="Error: Connection activation failed: (53) The Wi-Fi network "
+                                         "could not be found.\n"))
+    app, _, _ = make_app(runner)
+    open_scan(app)
+    select_network(app, "Office")
+    assert app.mode == MODE_RESULT and not app.result_ok
+    assert "could not be found" in app.result_message
+    assert runner.profiles.entries                   # a user's saved profile is never deleted
+
+
+def test_the_network_in_use_is_not_joined_again():
+    app, runner, _ = make_app(fake_nm(profiles=Profiles(("Home", "u-home", 5))))
+    open_scan(app)
+    before = len(runner.calls)
+    select_network(app, "Home")
+    assert app.mode == MODE_SCAN and app.status_line == "Already on Home"
+    assert len(runner.calls) == before
+
+
+def test_a_typed_hidden_network_that_is_saved_joins_directly():
+    app, runner, _ = make_app(fake_nm(profiles=Profiles(("Lab:5G", "u-lab", 3))))
+    open_scan(app)
+    app.scan_index = 1
+    app.handle_button(long_press=True)
+    type_text(app, "Lab:5G")
+    app.handle_key("submit")
+    assert runner.calls_with("connection", "up")[-1][4] == "u-lab"
+    assert app.mode == MODE_RESULT and app.result_ok
+
+
+def test_leaving_the_retry_prompt_goes_back_to_the_list():
+    runner = fake_nm(profiles=Profiles(("Office", "u-office", 1)))
+    runner.add(is_nmcli("connection", "up"), SECRETS)
+    app, _, _ = make_app(runner)
+    open_scan(app)
+    select_network(app, "Office")
+    app.handle_key("cancel")
+    assert app.mode == MODE_SCAN and app.status_line == ""
+    assert not runner.calls_with("modify")           # nothing typed, nothing changed
 
 
 def test_a_hidden_network_is_typed_in_and_flagged_hidden():
@@ -202,13 +349,15 @@ def test_a_hidden_network_is_typed_in_and_flagged_hidden():
 
 def test_a_failed_connect_explains_and_returns_to_the_list():
     runner = fake_nm()
+    # Not about the password (that goes back to the password field): the
+    # network went out of range while joining.
     runner.add(lambda a: "connect" in a,
-               done(returncode=4, stderr="Error: Connection activation failed: Secrets were required, "
-                                         "but not provided.\n"))
+               done(returncode=4, stderr="Error: Connection activation failed: (53) The Wi-Fi network "
+                                         "could not be found.\n"))
     app, _, _ = make_app(runner)
     open_scan(app)
     select_network(app, "Office")
-    type_text(app, "wrongpass")
+    type_text(app, "rightpass")
     app.handle_key("submit")
     assert app.mode == MODE_RESULT and not app.result_ok
     assert app.result_message.startswith("Connection activation failed")

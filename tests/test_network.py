@@ -75,3 +75,56 @@ def test_connect_command():
         "nmcli", "device", "wifi", "connect", "Home", "password", "secret99", "ifname", "wlan0"]
     assert network.connect_command("Lab", "", "", hidden=True) == [
         "nmcli", "device", "wifi", "connect", "Lab", "hidden", "yes"]
+
+
+# Real output from the Raspberry Pi: `nmcli -t -f UUID,TYPE connection show`
+# and the profile details, trimmed to three profiles.
+PI_UUIDS = ("9cd94ff6-ac18-4ba7-952b-39d8a0e022fb:802-11-wireless\n"
+            "e0225329-ce78-4408-b9c0-786895deef18:loopback\n"
+            "538d8e68-e5e4-4edc-9712-784936bcd4e0:802-11-wireless\n"
+            "d837fda8-2dce-4c72-987b-a0c0244f1c69:bluetooth\n")
+PI_PROFILES = ("connection.id:diswifi5G\nconnection.uuid:9cd94ff6-ac18-4ba7-952b-39d8a0e022fb\n"
+               "connection.timestamp:1790646678\n802-11-wireless.ssid:diswifi5G\n\n"
+               "connection.id:Sakmakmet ptaes lek 20 🌪️\nconnection.uuid:538d8e68-e5e4-4edc-9712-784936bcd4e0\n"
+               "connection.timestamp:0\n802-11-wireless.ssid:Sakmakmet ptaes lek 20 🌪️\n\n"
+               "connection.id:preconfigured\nconnection.uuid:aaaa\n"
+               "connection.timestamp:12\n802-11-wireless.ssid:Cafe:Guest\n")
+
+
+def test_wifi_profile_uuids_keeps_only_wifi():
+    assert network.wifi_profile_uuids(PI_UUIDS) == ["9cd94ff6-ac18-4ba7-952b-39d8a0e022fb",
+                                                    "538d8e68-e5e4-4edc-9712-784936bcd4e0"]
+
+
+def test_parse_profiles_keys_by_ssid_not_by_profile_name():
+    saved = network.parse_profiles(PI_PROFILES)
+    assert set(saved) == {"diswifi5G", "Sakmakmet ptaes lek 20 🌪️", "Cafe:Guest"}
+    assert saved["Cafe:Guest"].uuid == "aaaa" and saved["Cafe:Guest"].name == "preconfigured"
+    assert saved["diswifi5G"].last_used == 1790646678
+
+
+def test_parse_profiles_prefers_the_profile_used_last():
+    output = ("connection.id:Home\nconnection.uuid:old\nconnection.timestamp:100\n802-11-wireless.ssid:Home\n\n"
+              "connection.id:Home 1\nconnection.uuid:new\nconnection.timestamp:900\n802-11-wireless.ssid:Home\n\n"
+              "connection.id:Home 2\nconnection.uuid:never\nconnection.timestamp:0\n802-11-wireless.ssid:Home\n")
+    assert network.parse_profiles(output)["Home"].uuid == "new"
+    assert network.parse_profiles("") == {}
+
+
+def test_is_auth_failure():
+    assert network.is_auth_failure("Error: Connection activation failed: (7) Secrets were required, "
+                                   "but not provided.")
+    assert network.is_auth_failure("Error: Connection activation failed: 802.1X supplicant took too "
+                                   "long to authenticate")
+    assert network.is_auth_failure("Error: 802-11-wireless-security.psk: property is invalid.")
+    assert not network.is_auth_failure("Error: Connection activation failed: (53) The Wi-Fi network "
+                                       "could not be found.")
+    assert not network.is_auth_failure("Error: No network with SSID 'Lab' found.")
+
+
+def test_profile_commands():
+    assert network.up_command("u1", "wlan0") == ["nmcli", "connection", "up", "uuid", "u1", "ifname", "wlan0"]
+    assert network.set_password_command("u1", "pw") == [
+        "nmcli", "connection", "modify", "uuid", "u1", "802-11-wireless-security.psk", "pw"]
+    assert network.delete_command("u1") == ["nmcli", "connection", "delete", "uuid", "u1"]
+    assert network.profiles_command(["a", "b"])[-3:] == ["show", "a", "b"]

@@ -30,7 +30,9 @@ def registration(root: Path = PROJECT_ROOT) -> dict:
         "cwd": str(root),
         "env": {"WHISPLAY_APP_ID": APP_ID},
         "exit_gesture": "quad_click",
-        "priority": 150,
+        # 190 is the slot of Whisplay's built-in WiFi (Bluetooth 200, Volume
+        # 180, Power 170), which the installer takes off the desktop.
+        "priority": 190,
         "persist": True,
         "use_daemon_default_log": True,
         # Esc means "back" inside the app, not "leave it".

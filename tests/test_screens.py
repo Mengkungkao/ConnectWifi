@@ -11,11 +11,11 @@ from connectwifi.screens import (
 )
 
 NETWORKS = (
-    ("Home", 81, True, False),
-    ("Cafe Guest With A Very Long Network Name", 66, False, True),
-    ("Office", 55, False, False),
-    ("Neighbour", 44, False, False),
-    ("Garage", 41, False, False),
+    ("Home", 81, True, False, True),
+    ("Cafe Guest With A Very Long Network Name", 66, False, True, False),
+    ("Office", 55, False, False, True),
+    ("Neighbour", 44, False, False, False),
+    ("Garage", 41, False, False, False),
 )
 BASE = View(ble_installed=True, ble_active=True, ble_name="orangepizero2w", ble_key="k7m2x9qa",
             wifi_ssid="Home", wifi_ip="192.168.0.130", keyboard_ready=True, networks=NETWORKS)
@@ -29,6 +29,8 @@ SCREENS = {
     "ssid": View(**{**BASE.__dict__, "mode": MODE_SSID, "ssid": "Lab:5G", "status": "Type the network name"}),
     "password": View(**{**BASE.__dict__, "mode": MODE_PASSWORD, "ssid": "Office", "password_len": 9,
                         "password_known_secured": True}),
+    "password-retry": View(**{**BASE.__dict__, "mode": MODE_PASSWORD, "ssid": "Office",
+                              "password_known_secured": True, "status": "Wrong password - type it again"}),
     "connecting": View(**{**BASE.__dict__, "mode": MODE_CONNECTING, "connect_ssid": "Office", "phase": 9,
                           "elapsed": 4}),
     "result-ok": View(**{**BASE.__dict__, "mode": MODE_RESULT, "connect_ssid": "Office", "result_ok": True,
@@ -67,9 +69,10 @@ def test_rgb565_is_big_endian_565():
 
 
 def test_scan_rows_frame_the_networks_with_fixed_rows():
-    rows = scan_rows(View(networks=NETWORKS[:2]))
+    rows = scan_rows(View(networks=NETWORKS[:3]))
     assert rows[0] == ("Back", "") and rows[1] == ("Type hidden network...", "")
     assert rows[2] == ("Home", "now") and rows[3][1] == "66% open"
+    assert rows[4] == ("Office", "55% saved")
     assert rows[-1] == ("Rescan wider range", "")
     assert scan_rows(View(scan_wide=True))[-1] == ("Rescan", "")
 

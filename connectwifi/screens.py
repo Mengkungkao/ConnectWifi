@@ -55,7 +55,7 @@ class View:
     scan_index: int = 0
     scan_window: int = 0
     scan_wide: bool = False
-    # (ssid, signal, active, is_open) per network
+    # (ssid, signal, active, is_open, saved) per network
     networks: tuple = ()
     connect_ssid: str = ""
     result_ok: bool = False
@@ -102,10 +102,14 @@ def rgb565_bytes(image: Image.Image) -> bytes:
 def scan_rows(view: View) -> list[tuple[str, str]]:
     """(label, meta) for every row of the scan list, in order."""
     rows = [(name, "") for name in SCAN_LEADING]
-    rows += [
-        (ssid, "now" if active else (f"{signal}% open" if is_open else f"{signal}%"))
-        for ssid, signal, active, is_open in view.networks
-    ]
+    for ssid, signal, active, is_open, saved in view.networks:
+        if active:
+            meta = "now"
+        elif saved:
+            meta = f"{signal}% saved"     # joins without asking for the password
+        else:
+            meta = f"{signal}% open" if is_open else f"{signal}%"
+        rows.append((ssid, meta))
     rows.append(("Rescan" if view.scan_wide else "Rescan wider range", ""))
     return rows
 

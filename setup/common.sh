@@ -247,6 +247,86 @@ check_nm_permissions() {
     fi
 }
 
+# ----------------------------------------------------- staying on Wi-Fi
+NM_POWERSAVE_CONF=/etc/NetworkManager/conf.d/zz-connectwifi-wifi-powersave-off.conf
+KEEPALIVE=connectwifi-keepalive
+
+wifi_powersave() {
+    # wifi.powersave once every config file is read: 2 off, 3 on, empty
+    # when it is left to the driver.
+    local nm
+    nm=$(command -v NetworkManager || echo /usr/sbin/NetworkManager)
+    "$nm" --print-config 2>/dev/null | sed -n 's/^wifi\.powersave=//p' | tail -1
+}
+
+keep_wifi_up() {
+    case "$(wifi_powersave)" in
+        3)
+            warn "Wi-Fi power saving is on"
+            info "On the Orange Pi Zero 2W it gets the board dropped by the router. The"
+            info "image means to turn it off (20-override-wifi-powersave-disable.conf), but"
+            info "NetworkManager reads config files alphabetically, so Ubuntu's"
+            info "default-wifi-powersave-on.conf comes last and turns it back on."
+            info "Off costs some battery."
+            if ask "turn Wi-Fi power saving off?"; then
+                printf '%s\n' "# Written by ConnectWifi installer. Named to sort after" \
+                    "# default-wifi-powersave-on.conf, which would otherwise be read last." \
+                    "[connection]" "wifi.powersave = 2" | sudo tee "$NM_POWERSAVE_CONF" >/dev/null &&
+                    sudo systemctl reload NetworkManager && ok "wrote $NM_POWERSAVE_CONF"
+                # NetworkManager applies it at the next connect; iw applies it now,
+                # without dropping the connection.
+                local iw
+                iw=$(command -v iw || echo /usr/sbin/iw)
+                if [ -n "${WIFI_DEVICE:-}" ] && [ -x "$iw" ]; then
+                    sudo "$iw" dev "$WIFI_DEVICE" set power_save off && ok "off on $WIFI_DEVICE from now"
+                fi
+            else
+                warn "left on"
+            fi
+            ;;
+        2) ok "Wi-Fi power saving is off" ;;
+        *) ok "Wi-Fi power saving is left to the driver" ;;
+    esac
+
+    local service=/etc/systemd/system/$KEEPALIVE.service
+    if systemctl is-enabled --quiet "$KEEPALIVE.service" 2>/dev/null &&
+       grep -qx "WorkingDirectory=$HERE" "$service" 2>/dev/null; then
+        ok "the Wi-Fi keep-alive is on (checks every minute)"
+        return
+    fi
+    info "When Wi-Fi drops and a failed reconnect looks like a wrong password,"
+    info "NetworkManager waits for a new one and stops trying. The keep-alive"
+    info "brings the saved network back within a minute or two. It runs as $USER."
+    ask "turn on the Wi-Fi keep-alive?" || { info "skipped"; return; }
+    # One long-running process rather than a timer: a timer's job would put
+    # "Starting"/"Finished" in the journal every minute.
+    sudo tee "$service" >/dev/null <<EOF
+[Unit]
+Description=ConnectWifi: bring Wi-Fi back when NetworkManager gives up
+After=NetworkManager.service
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$HERE
+ExecStart=$(command -v python3) -m connectwifi.keepalive
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=30
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    if sudo systemctl daemon-reload && sudo systemctl enable --now "$KEEPALIVE.service" >/dev/null 2>&1 &&
+       sleep 2 && systemctl is-active --quiet "$KEEPALIVE.service"; then
+        ok "the Wi-Fi keep-alive is running"
+    else
+        bad "the keep-alive did not start:"
+        journalctl -u "$KEEPALIVE.service" -n 6 --no-pager 2>/dev/null | sed 's/^/           /'
+    fi
+}
+
 # ------------------------------------------------------------ BLE service
 ble_unit_arg() {
     # ble_unit_arg --name -> the value in the installed unit, if any
@@ -512,9 +592,10 @@ whisplay_dir() {
 }
 
 replace_whisplay_wifi() {
-    # Whisplay's built-in "WiFi" app and its example "WiFi Config" do what
-    # this app does; setup/whisplay_wifi.py takes both off the desktop,
-    # keeping backups that ./uninstall.sh restores.
+    # Whisplay's built-in "WiFi" and its example "WiFi Config" do what this
+    # app does, and Connect WiFi sits in the built-in's place on the desktop.
+    # setup/whisplay_wifi.py takes only their menu entries off; Whisplay's
+    # code stays. ./uninstall.sh puts the entries back.
     if [ "$KEEP_WHISPLAY_WIFI" = 1 ]; then
         info "kept (--keep-whisplay-wifi)"
         return
@@ -528,17 +609,17 @@ replace_whisplay_wifi() {
         warn "$state"
         return
     fi
-    if [ "$state" = "built-in WiFi: removed; example WiFi Config: removed" ]; then
-        ok "Whisplay's own WiFi apps are already removed ($root)"
+    if [ "$state" = "built-in WiFi: hidden; example WiFi Config: hidden" ]; then
+        ok "Whisplay's own WiFi entries are off the desktop ($root)"
         return
     fi
     info "$root -- $state"
-    info "Connect WiFi replaces these. Removing them edits Whisplay's"
-    info "daemon/internal_apps/manager.py (backed up; ./uninstall.sh restores it)."
-    ask "remove Whisplay's own WiFi apps?" || { info "kept"; return; }
+    info "Connect WiFi takes their place. Only the menu entries go: one line of"
+    info "daemon/internal_apps/manager.py, backed up; Whisplay's WiFi code stays."
+    ask "take Whisplay's own WiFi entries off the desktop?" || { info "kept"; return; }
     local out runner=()
     [ -w "$root/daemon/internal_apps/manager.py" ] || runner=(sudo env "HOME=$HOME")
-    if out=$("${runner[@]}" python3 setup/whisplay_wifi.py remove "$root" 2>&1); then
+    if out=$("${runner[@]}" python3 setup/whisplay_wifi.py hide "$root" 2>&1); then
         echo "$out" | sed 's/^/    ok   /'
         DAEMON_RESTART_NEEDED=1
     else

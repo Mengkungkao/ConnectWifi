@@ -9,7 +9,7 @@
 #   ./install-orangepi.sh --yes            accept every prompt (unattended)
 #   ./install-orangepi.sh --check          report only; change nothing
 #   ./install-orangepi.sh --no-ble         leave out the Bluetooth LE setup service
-#   ./install-orangepi.sh --keep-whisplay-wifi   keep Whisplay's own WiFi apps
+#   ./install-orangepi.sh --keep-whisplay-wifi   keep Whisplay's own WiFi entries on the desktop
 #   ./install-orangepi.sh --ble-name N --ble-key K   name and key the phone sees
 #
 # What differs from the Raspberry Pi: the Zero 2W's Bluetooth (UWE5622)
@@ -88,6 +88,7 @@ fi
 step "NetworkManager"
 if check_networkmanager; then
     check_nm_permissions
+    keep_wifi_up
 else
     info "Orange Pi OS and Armbian ship NetworkManager; install it with"
     info "sudo apt install network-manager, or turn it on in orangepi-config / armbian-config."
@@ -110,7 +111,7 @@ step "Adding the app to the HAT desktop"
 register_with_daemon
 
 # --------------------------------------------------- 9. Whisplay's WiFi
-step "Replacing Whisplay's own WiFi apps"
+step "Putting Connect WiFi in place of Whisplay's WiFi"
 replace_whisplay_wifi
 restart_daemon_if_needed
 run_selftest

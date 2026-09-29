@@ -20,10 +20,24 @@ class Network:
     signal: int
     security: str
     active: bool = False
+    # NetworkManager has a profile for it: joining needs no password.
+    saved: bool = False
 
     @property
     def is_open(self) -> bool:
         return self.security.strip().lower() in OPEN_SECURITY
+
+
+@dataclass
+class SavedNetwork:
+    """A Wi-Fi profile NetworkManager keeps, password and all. Its name is
+    often, but not always, the SSID: Raspberry Pi OS calls the one made at
+    imaging "preconfigured"."""
+
+    ssid: str
+    uuid: str
+    name: str = ""
+    last_used: int = 0
 
 
 def split_fields(line: str) -> list[str]:
@@ -119,6 +133,77 @@ def scan_permitted(output: str) -> bool:
         if len(fields) >= 2 and fields[0].endswith("wifi.scan"):
             return fields[1].strip() == "yes"
     return False
+
+
+PROFILE_FIELDS = "connection.id,connection.uuid,connection.timestamp,802-11-wireless.ssid"
+
+
+def wifi_profile_uuids(output: str) -> list[str]:
+    """Wi-Fi profiles in `nmcli -t -f UUID,TYPE connection show`."""
+    uuids = []
+    for line in output.splitlines():
+        fields = split_fields(line)
+        if len(fields) >= 2 and fields[1] == "802-11-wireless":
+            uuids.append(fields[0])
+    return uuids
+
+
+def parse_profiles(output: str) -> dict[str, SavedNetwork]:
+    """`nmcli -t -f PROFILE_FIELDS connection show UUID...`: one block of
+    `field:value` lines per profile, blank-line separated. Values are not
+    escaped here, unlike in list output, so split at the first colon. When
+    one SSID has several profiles -- retries leave "Home 1" behind -- the
+    one used last wins."""
+    saved: dict[str, SavedNetwork] = {}
+    for block in output.split("\n\n"):
+        values = {}
+        for line in block.splitlines():
+            name, _, value = line.partition(":")
+            values[name] = value
+        ssid, uuid = values.get("802-11-wireless.ssid", ""), values.get("connection.uuid", "")
+        if not ssid or not uuid:
+            continue
+        try:
+            last_used = int(values.get("connection.timestamp") or 0)
+        except ValueError:
+            last_used = 0
+        known = saved.get(ssid)
+        if known is None or last_used > known.last_used:
+            saved[ssid] = SavedNetwork(ssid, uuid, values.get("connection.id", ""), last_used)
+    return saved
+
+
+def profiles_command(uuids: list[str]) -> list[str]:
+    return ["nmcli", "-t", "-f", PROFILE_FIELDS, "connection", "show", *uuids]
+
+
+def up_command(uuid: str, device: str) -> list[str]:
+    return ["nmcli", "connection", "up", "uuid", uuid, *_ifname(device)]
+
+
+def set_password_command(uuid: str, password: str) -> list[str]:
+    return ["nmcli", "connection", "modify", "uuid", uuid, "802-11-wireless-security.psk", password]
+
+
+def delete_command(uuid: str) -> list[str]:
+    return ["nmcli", "connection", "delete", "uuid", uuid]
+
+
+# How NetworkManager words a rejected or missing password. A wrong WPA key
+# ends with it asking for new secrets and, with no one to answer, "(7)
+# Secrets were required, but not provided". Some drivers never report the
+# failed handshake, so it shows up as the supplicant timing out instead.
+AUTH_FAILURES = (
+    "secrets were required",
+    "802.1x supplicant",
+    "802-11-wireless-security.psk",
+    "no secrets",
+)
+
+
+def is_auth_failure(message: str) -> bool:
+    lowered = message.lower()
+    return any(phrase in lowered for phrase in AUTH_FAILURES)
 
 
 def _ifname(device: str) -> list[str]:

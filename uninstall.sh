@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Remove what the installer added: the desktop entry, the sudo rule and the
-# polkit grant, and put back Whisplay's own WiFi apps if the installer took
-# them off. The BLE service is left alone unless --ble is given, since a
-# Whisplay image ships it too.
+# Remove what the installer added: the desktop entry, the sudo rule, the
+# polkit grant, the Wi-Fi keep-alive and the power-saving override. Put
+# Whisplay's own WiFi entries back on the desktop if the installer took them
+# off. The BLE service is left alone unless --ble is given, since a Whisplay
+# image ships it too.
 #
-#   ./uninstall.sh          remove the app; restore Whisplay's WiFi apps
+#   ./uninstall.sh          remove the app; list Whisplay's WiFi again
 #   ./uninstall.sh --ble    also stop and remove sugar-wifi-conf
 set -uo pipefail
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
@@ -20,6 +21,14 @@ sudo rm -f /etc/sudoers.d/connectwifi \
     /etc/polkit-1/localauthority/50-local.d/50-connectwifi-networkmanager.pkla \
     && echo "removed the sudo rule and polkit grant"
 
+sudo systemctl disable --now connectwifi-keepalive.service 2>/dev/null
+if sudo rm -f /etc/systemd/system/connectwifi-keepalive.service \
+        /etc/NetworkManager/conf.d/zz-connectwifi-wifi-powersave-off.conf; then
+    sudo systemctl daemon-reload
+    sudo systemctl reload NetworkManager 2>/dev/null
+    echo "removed the Wi-Fi keep-alive and the power-saving override"
+fi
+
 # The Whisplay checkout the daemon runs from, as the installer found it.
 script=$(systemctl show -p ExecStart --value whisplay-daemon 2>/dev/null |
          grep -oE '[^ ;=]+/daemon/whisplay_daemon\.py' | head -1)
@@ -33,7 +42,7 @@ if [ -n "$script" ]; then
             RESTART=1
         fi
     else
-        echo "could not restore Whisplay's WiFi apps: $out" >&2
+        echo "could not put back Whisplay's WiFi entries: $out" >&2
     fi
 fi
 

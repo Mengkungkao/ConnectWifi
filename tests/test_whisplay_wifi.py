@@ -94,55 +94,79 @@ def snapshot(root, home):
 
 
 @pytest.mark.parametrize("version", VERSIONS)
-def test_remove_takes_the_wifi_app_off_the_daemon(tmp_path, version):
+def test_hide_takes_the_wifi_entries_off_the_desktop_only(tmp_path, version):
     root, home = make_whisplay(tmp_path, version)
     before = daemon_view(root)
-    assert "whisplay-wifi" in before["apps"] and before["typing"] is True
+    assert "whisplay-wifi" in before["apps"]
+    original = (root / "daemon/internal_apps/manager.py").read_text()
 
-    result = tool("remove", root, home)
+    result = tool("hide", root, home)
     assert result.returncode == 0, result.stderr
     after = daemon_view(root)
-    assert "whisplay-wifi" not in after["apps"]
     assert after["apps"] == [app for app in before["apps"] if app != "whisplay-wifi"]
-    assert after["typing"] is False and after["wifi_is_internal"] is False
-    assert not (root / "daemon/internal_apps/wifi_app.py").exists()
+    # The app is still wired in exactly as before: only its listing went.
+    assert after["wifi_is_internal"] is True and after["typing"] is True
+    assert (root / "daemon/internal_apps/wifi_app.py").exists()
+    edited = (root / "daemon/internal_apps/manager.py").read_text()
+    removed = [line for line in original.splitlines() if line not in edited.splitlines()]
+    assert all("self.wifi.builtin_app()" in line for line in removed)
+    # The example's menu entries go; its program would stay.
     assert not (root / "daemon/default_apps/whisplay-wifi-config.json").exists()
     assert not (home / ".whisplay-daemon/app/whisplay-wifi-config.json").exists()
     assert tool("status", root, home).stdout.strip() == \
-        "built-in WiFi: removed; example WiFi Config: removed"
+        "built-in WiFi: hidden; example WiFi Config: hidden"
 
 
 @pytest.mark.parametrize("version", VERSIONS)
 def test_restore_puts_back_exactly_what_was_there(tmp_path, version):
     root, home = make_whisplay(tmp_path, version)
     original = snapshot(root, home)
-    assert tool("remove", root, home).returncode == 0
+    assert tool("hide", root, home).returncode == 0
     result = tool("restore", root, home)
     assert result.returncode == 0, result.stderr
     assert snapshot(root, home) == original
     assert "whisplay-wifi" in daemon_view(root)["apps"]
 
 
-def test_remove_twice_is_harmless(tmp_path):
+def test_hide_twice_is_harmless(tmp_path):
     root, home = make_whisplay(tmp_path, VERSIONS[0])
-    tool("remove", root, home)
-    again = tool("remove", root, home)
+    tool("hide", root, home)
+    again = tool("hide", root, home)
     assert again.returncode == 0 and again.stdout.strip() == "nothing to do"
     # The backup still holds the true original, not the edited file.
     backup = root / "daemon/internal_apps/.connectwifi-backup/manager.py"
     assert backup.read_text() == (FIXTURES / VERSIONS[0]).read_text()
 
 
-def test_an_unfamiliar_whisplay_is_left_untouched(tmp_path):
-    # A future version that uses the app somewhere this tool does not know.
+def test_an_unfamiliar_desktop_list_is_left_untouched(tmp_path):
+    # A future version that builds the list some other way: the Wi-Fi entry
+    # cannot be taken out as one item, so nothing is changed.
     root, home = make_whisplay(tmp_path, VERSIONS[0], example=False)
     manager = root / "daemon/internal_apps/manager.py"
-    manager.write_text(manager.read_text() + "\n\ndef poke(m):\n    return m.wifi.state if m else None\n")
-    before = manager.read_bytes()
-    result = tool("remove", root, home)
-    assert result.returncode == 1 and "still refers" in result.stderr
-    assert manager.read_bytes() == before
-    assert (root / "daemon/internal_apps/wifi_app.py").exists()
+    source = manager.read_text()
+    source = source.replace("            self.wifi.builtin_app(),\n",
+                            "            self.wifi.builtin_app() if self.wifi else None,\n")
+    manager.write_text(source)
+    assert tool("status", root, home).stdout.strip().startswith("built-in WiFi: listed")
+    result = tool("hide", root, home)
+    assert result.returncode == 1 and "does not know" in result.stderr
+    assert manager.read_text() == source
+    assert tool("status", root, home).stdout.strip().startswith("built-in WiFi: listed")
+
+
+def test_an_edit_that_strays_is_undone(tmp_path, monkeypatch):
+    sys.path.insert(0, os.path.join(ROOT, "setup"))
+    import whisplay_wifi
+
+    root, home = make_whisplay(tmp_path, VERSIONS[0], example=False)
+    manager = root / "daemon/internal_apps/manager.py"
+    original = manager.read_text()
+    real_unlist = whisplay_wifi.unlist
+    monkeypatch.setattr(whisplay_wifi, "unlist",
+                        lambda source: real_unlist(source).replace("self._lock", "self._lock2", 1))
+    with pytest.raises(whisplay_wifi.Refused, match="beyond the desktop list"):
+        whisplay_wifi.hide(root)
+    assert manager.read_text() == original
 
 
 def test_not_a_whisplay_checkout(tmp_path):

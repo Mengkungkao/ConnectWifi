@@ -9,7 +9,7 @@
 #   ./install-raspberrypi.sh --check          report only; change nothing
 #   ./install-raspberrypi.sh --country GB     set the Wi-Fi country
 #   ./install-raspberrypi.sh --no-ble         leave out the Bluetooth LE setup service
-#   ./install-raspberrypi.sh --keep-whisplay-wifi   keep Whisplay's own WiFi apps
+#   ./install-raspberrypi.sh --keep-whisplay-wifi   keep Whisplay's own WiFi entries on the desktop
 #   ./install-raspberrypi.sh --ble-name N --ble-key K   name and key the phone sees
 #
 # What differs from the Orange Pi: Raspberry Pi OS keeps the Wi-Fi radio
@@ -82,6 +82,7 @@ fi
 step "NetworkManager"
 if check_networkmanager; then
     check_nm_permissions
+    keep_wifi_up
 else
     info "Bookworm and later use NetworkManager. On an older image, switch with:"
     info "sudo raspi-config  ->  Advanced Options  ->  Network Config  ->  NetworkManager"
@@ -104,7 +105,7 @@ step "Adding the app to the HAT desktop"
 register_with_daemon
 
 # --------------------------------------------------- 9. Whisplay's WiFi
-step "Replacing Whisplay's own WiFi apps"
+step "Putting Connect WiFi in place of Whisplay's WiFi"
 replace_whisplay_wifi
 restart_daemon_if_needed
 run_selftest
