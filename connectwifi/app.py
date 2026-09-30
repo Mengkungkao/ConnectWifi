@@ -12,7 +12,7 @@ import time
 
 from connectwifi import network
 from connectwifi.ble import BleService, BleStatus
-from connectwifi.keyboard import KeyboardReader, keyboard_device_paths
+from connectwifi.keyboard import SdkKeyboardReader, keyboard_device_paths
 from connectwifi.screens import (
     MENU_COUNT, MENU_EXIT, MENU_SCAN, MENU_TOGGLE_BLE, MODE_CONNECTING, MODE_MENU,
     MODE_PASSWORD, MODE_RESULT, MODE_SCAN, MODE_SSID, SCAN_LEADING, VISIBLE_SCAN_ROWS,
@@ -565,4 +565,4 @@ class ConnectWifiApp:
 def main():
     from connectwifi.board import create_board
 
-    ConnectWifiApp(create_board(), keyboard=KeyboardReader()).run()
+    ConnectWifiApp(create_board(), keyboard=SdkKeyboardReader()).run()

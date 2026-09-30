@@ -1,4 +1,11 @@
-"""USB or Bluetooth keyboard input, read straight from evdev.
+"""USB or Bluetooth keyboard input.
+
+``SdkKeyboardReader`` is what the app uses: the MFruit App SDK's reader
+(vendored in mfruit_sdk/). While MFruit OS runs, it holds every keyboard
+exclusively -- so no key reaches the Linux console -- and hands this app
+the keys typed while it is on screen; without MFruit OS, the SDK reads the
+devices directly. ``KeyboardReader`` below is the old direct reader, kept
+for its key map and device filter.
 
 The reader loop and key map come from Whisplay's daemon
 (daemon/internal_apps/keyboard.py, PiSugar, Apache-2.0). They are copied
@@ -204,3 +211,50 @@ class KeyboardReader:
         action = key_action(code, self._shift_down)
         if action is not None:
             callback(action)
+
+
+APP_ID = "connectwifi"
+
+
+class SdkKeyboardReader:
+    """The same start(callback) / stop() and actions as ``KeyboardReader``,
+    from the MFruit App SDK's keyboard reader (MFruit OS's key hub)."""
+
+    NAMED = {"up": "up", "down": "down", "enter": "submit", "escape": "cancel",
+             "backspace": "backspace"}
+    ONCE = {"enter", "escape"}
+
+    def __init__(self, app_id: str = APP_ID):
+        self.app_id = app_id
+        self._reader = None
+        self._callback = None
+
+    def start(self, callback):
+        from mfruit_sdk.keys import KeyReader
+
+        self.stop()
+        self._callback = callback
+        self._reader = KeyReader(self.handle, app_id=self.app_id)
+        self._reader.start()
+
+    def stop(self):
+        if self._reader is not None:
+            self._reader.stop()
+            self._reader = None
+        self._callback = None
+
+    def handle(self, event):
+        """One KeyEvent -> this app's action, like ``key_action`` does for codes."""
+        from mfruit_sdk.keys import DOWN, REPEAT
+
+        callback = self._callback
+        if callback is None or event.action not in (DOWN, REPEAT):
+            return
+        if event.kind == "char":
+            callback(("char", event.value))
+        elif event.value == "space":
+            callback(("char", " "))
+        elif event.value in self.NAMED:
+            if event.action == REPEAT and event.value in self.ONCE:
+                return
+            callback(self.NAMED[event.value])

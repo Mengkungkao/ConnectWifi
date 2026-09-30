@@ -77,3 +77,26 @@ def test_restart_does_not_leave_the_old_reader_running():
     reader.start(lambda action: None)
     assert first.is_set() and not reader._stop_event.is_set()
     reader.stop()
+
+
+def test_sdk_reader_maps_keys_to_the_apps_actions():
+    """The MFruit App SDK's keys (through MFruit OS's key hub) become the same
+    actions the app always handled."""
+    from mfruit_sdk.keys import DOWN, REPEAT, UP, KeyEvent
+
+    actions = []
+    reader = keyboard.SdkKeyboardReader()
+    reader._callback = actions.append
+    for event in (KeyEvent("key", "up", DOWN, 103), KeyEvent("key", "down", REPEAT, 108),
+                  KeyEvent("key", "enter", DOWN, 28), KeyEvent("key", "enter", REPEAT, 28),
+                  KeyEvent("key", "escape", DOWN, 1), KeyEvent("key", "backspace", DOWN, 14),
+                  KeyEvent("key", "space", DOWN, 57), KeyEvent("char", "A", DOWN, 30),
+                  KeyEvent("key", "enter", UP, 28), KeyEvent("key", "home", DOWN, 102)):
+        reader.handle(event)
+    assert actions == ["up", "down", "submit", "cancel", "backspace", ("char", " "),
+                       ("char", "A")]
+
+
+def test_sdk_reader_asks_for_this_apps_keys():
+    reader = keyboard.SdkKeyboardReader()
+    assert reader.app_id == "connectwifi"
