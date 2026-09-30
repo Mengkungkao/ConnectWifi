@@ -29,7 +29,10 @@ def registration(root: Path = PROJECT_ROOT) -> dict:
         "launch_command": str(root / "run.sh"),
         "cwd": str(root),
         "env": {"WHISPLAY_APP_ID": APP_ID},
-        "exit_gesture": "quad_click",
+        # Every short press moves one row. Counting a burst here as an exit
+        # closes Wi-Fi while the user is simply scrolling toward the bottom.
+        # Back is an explicit row, selected with a hold (or keyboard Enter).
+        "exit_gesture": "none",
         # 190 is the slot of Whisplay's built-in WiFi (Bluetooth 200, Volume
         # 180, Power 170), which the installer takes off the desktop.
         "priority": 190,

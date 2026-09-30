@@ -4,7 +4,7 @@ from conftest import FakeRunner, done
 from connectwifi import app as appmod
 from connectwifi import network
 from connectwifi.screens import (
-    MENU_EXIT, MENU_SCAN, MENU_TOGGLE_BLE, MODE_CONNECTING, MODE_MENU, MODE_PASSWORD,
+    MENU_EXIT, MENU_HIDDEN, MENU_SCAN, MENU_TOGGLE_BLE, MODE_CONNECTING, MODE_MENU, MODE_PASSWORD,
     MODE_RESULT, MODE_SCAN, MODE_SSID, VISIBLE_SCAN_ROWS,
 )
 from connectwifi.system import Commands
@@ -149,10 +149,50 @@ def test_status_polling_never_sweeps_the_radio():
 
 def test_short_press_steps_and_wraps_the_menu():
     app, _, _ = make_app()
-    assert app.menu_index == MENU_TOGGLE_BLE
-    for expected in (MENU_SCAN, MENU_EXIT, MENU_TOGGLE_BLE):
+    assert app.menu_index == MENU_SCAN
+    for expected in (MENU_HIDDEN, MENU_TOGGLE_BLE, MENU_EXIT, MENU_SCAN):
         app.handle_button(long_press=False)
         assert app.menu_index == expected
+        assert app.running and app.mode == MODE_MENU
+
+
+def test_back_to_settings_requires_selection():
+    app, _, _ = make_app()
+    for _ in range(3):
+        app.handle_button(long_press=False)
+    assert app.menu_index == MENU_EXIT and app.running
+    app.handle_button(long_press=True)
+    assert not app.running
+
+
+def test_repeated_raw_taps_only_navigate_then_hold_selects_back(monkeypatch):
+    app, _, board = make_app()
+    open_scan(app)
+    now = [100.0]
+    monkeypatch.setattr(appmod.time, "monotonic", lambda: now[0])
+    for _ in range(app._scan_row_count() * 2):
+        board.press()
+        now[0] += 0.04
+        board.release()
+        now[0] += 0.04
+        assert app.running and app.mode == MODE_SCAN
+    while app.scan_index != app._scan_row_count() - 1:
+        board.press()
+        now[0] += 0.04
+        board.release()
+    assert app.running
+    board.press()
+    assert not app.view().hold_armed
+    now[0] += appmod.LONG_PRESS_SEC
+    assert app.view().hold_armed
+    board.release()
+    assert not app.running
+
+
+def test_unmatched_release_does_not_move_selection():
+    app, _, board = make_app()
+    board.release()
+    assert app.menu_index == MENU_SCAN
 
 
 def test_first_scan_shows_only_what_is_nearby_from_the_cache():
@@ -377,7 +417,8 @@ def test_not_authorized_points_at_the_installer():
 
 def test_ble_switch_uses_sudo_and_reports():
     app, runner, _ = make_app()
-    app.handle_button(long_press=True)           # menu item 0: Turn BLE on
+    app.menu_index = MENU_TOGGLE_BLE
+    app.handle_button(long_press=True)
     assert runner.calls[-1] == ["sudo", "-n", "systemctl", "start", "sugar-wifi-config.service"]
     assert app.status_line == "BLE started"
 
@@ -389,6 +430,7 @@ def test_ble_switch_uses_sudo_and_reports():
 
 def test_ble_switch_without_the_service_says_so_and_runs_nothing():
     app, runner, _ = make_app(fake_nm(ble=BLE_MISSING))
+    app.menu_index = MENU_TOGGLE_BLE
     before = len(runner.calls)
     app.handle_button(long_press=True)
     assert "installer" in app.status_line and len(runner.calls) == before
@@ -399,14 +441,14 @@ def test_input_is_ignored_while_a_worker_runs():
     app.busy = True
     app.handle_button(long_press=False)
     app.handle_key("down")
-    assert app.menu_index == MENU_TOGGLE_BLE
+    assert app.menu_index == MENU_SCAN
 
 
 def test_long_lists_scroll_and_wrap():
     many = "".join(f" :Net{i:02d}:{90 - i}:WPA2\n" for i in range(12))
     app, _, _ = make_app(fake_nm(cached=many, swept=many))
     open_scan(app)
-    total = 2 + 12 + 1
+    total = 2 + 12 + 2
     for _ in range(VISIBLE_SCAN_ROWS + 2):
         app.handle_key("down")
     assert app.scan_index == 2 + VISIBLE_SCAN_ROWS + 2
@@ -444,13 +486,24 @@ def test_hold_cancels_typing():
 def test_long_press_timing_comes_from_the_button_events(monkeypatch):
     app, _, board = make_app()
     clock = iter([100.0, 100.3, 200.0, 201.2])
-    monkeypatch.setattr(appmod.time, "time", lambda: next(clock))
+    monkeypatch.setattr(appmod.time, "monotonic", lambda: next(clock))
     board.press()
     board.release()                             # 0.3 s: next
-    assert app.menu_index == MENU_SCAN
+    assert app.menu_index == MENU_HIDDEN
     board.press()
     board.release()                             # 1.2 s: select
-    assert app.mode == MODE_SCAN
+    assert app.mode == MODE_SSID
+
+
+def test_first_frame_precedes_blocking_startup_work():
+    app, _, board = make_app()
+    queued = []
+    app._start_thread = queued.append
+    app.probe = lambda: pytest.fail("Probe ran before the first frame")
+    app.poll_status = lambda: pytest.fail("Status ran before the first frame")
+    app.running = False
+    app.run()
+    assert board.frames and len(queued) == 1 and board.cleaned_up
 
 
 def test_the_exit_gesture_stops_the_loop_and_releases_the_screen():

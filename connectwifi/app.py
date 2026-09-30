@@ -7,6 +7,8 @@ Typing needs a keyboard; without one, the BLE service is the way on.
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 
@@ -14,11 +16,12 @@ from connectwifi import network
 from connectwifi.ble import BleService, BleStatus
 from connectwifi.keyboard import SdkKeyboardReader, keyboard_device_paths
 from connectwifi.screens import (
-    MENU_COUNT, MENU_EXIT, MENU_SCAN, MENU_TOGGLE_BLE, MODE_CONNECTING, MODE_MENU,
-    MODE_PASSWORD, MODE_RESULT, MODE_SCAN, MODE_SSID, SCAN_LEADING, VISIBLE_SCAN_ROWS,
-    Screens, View, rgb565_bytes,
+    MENU_COUNT, MENU_EXIT, MENU_HIDDEN, MENU_SCAN, MENU_TOGGLE_BLE, MODE_CONNECTING,
+    MODE_MENU, MODE_PASSWORD, MODE_RESULT, MODE_SCAN, MODE_SSID, SCAN_LEADING,
+    VISIBLE_SCAN_ROWS, Screens, View, rgb565_bytes,
 )
 from connectwifi.system import Commands, output_of
+from mfruit_sdk.status import StatusMonitor
 
 POLL_INTERVAL_SEC = 2.0
 FRAME_INTERVAL_SEC = 0.08
@@ -28,6 +31,13 @@ PASSWORD_MAX_LEN = 63
 WPA_MIN_LEN = 8
 # First pass shows only what is comfortably in range; Rescan drops the floor.
 NEARBY_MIN_SIGNAL = 40
+
+LED_SIGNAL = {
+    0: (220, 36, 30),       # disconnected
+    1: (255, 150, 20),      # weak
+    2: (30, 150, 255),      # usable
+    3: (35, 215, 95),       # strong
+}
 
 
 def _start_daemon_thread(target):
@@ -44,11 +54,12 @@ class ConnectWifiApp:
         self._start_thread = start_thread
         self._keyboard_paths = keyboard_paths
         self.screens = Screens(board.LCD_WIDTH, board.LCD_HEIGHT)
+        self.status_monitor = StatusMonitor(interval=5.0)
         self.running = True
 
         self.lock = threading.RLock()
         self.mode = MODE_MENU
-        self.menu_index = MENU_TOGGLE_BLE
+        self.menu_index = MENU_SCAN
         self.ssid_buffer = ""
         self.password_buffer = ""
         self.status_line = ""
@@ -77,6 +88,9 @@ class ConnectWifiApp:
         self._last_view = None
         self._last_poll_at = 0.0
         self._button_down_at = 0.0
+        self._button_is_down = False
+        self._led_enabled, self._led_brightness = _led_preferences()
+        self._last_led = None
 
         board.on_button_press(self._on_press)
         board.on_button_release(self._on_release)
@@ -112,11 +126,15 @@ class ConnectWifiApp:
     # ---------- button ----------
 
     def _on_press(self):
-        self._button_down_at = time.time()
+        self._button_down_at = time.monotonic()
+        self._button_is_down = True
 
     def _on_release(self):
-        held = time.time() - self._button_down_at if self._button_down_at else 0.0
+        if not self._button_is_down:
+            return  # a release from the screen that launched us is not a tap
+        held = time.monotonic() - self._button_down_at
         self._button_down_at = 0.0
+        self._button_is_down = False
         self.handle_button(held >= LONG_PRESS_SEC)
 
     def handle_button(self, long_press: bool):
@@ -203,7 +221,7 @@ class ConnectWifiApp:
     # ---------- navigation ----------
 
     def _scan_row_count(self) -> int:
-        return len(SCAN_LEADING) + len(self.networks) + 1  # + the trailing rescan
+        return len(SCAN_LEADING) + len(self.networks) + 2  # Rescan, Back to Settings
 
     def _move_scan(self, delta: int):
         total = self._scan_row_count()
@@ -219,23 +237,32 @@ class ConnectWifiApp:
         self.status_line = ""
 
     def _activate_menu_item(self):
-        if self.menu_index == MENU_TOGGLE_BLE:
-            if not self.ble_status.installed:
-                self.status_line = "BLE: run the installer to add it"
-                return
-            self.status_line = "Working..."
-            self._spawn(self._toggle_ble)
-        elif self.menu_index == MENU_SCAN:
+        if self.menu_index == MENU_SCAN:
             self.mode = MODE_SCAN
             self.scan_index = len(SCAN_LEADING) if self.networks else 0
             self.scan_window = 0
             self.status_line = "Checking nearby..."
             self._spawn(lambda: self._scan(wide=False))
+        elif self.menu_index == MENU_HIDDEN:
+            self.mode = MODE_SSID
+            self.ssid_buffer = ""
+            self.password_buffer = ""
+            self.password_return = MODE_SSID
+            self.status_line = "Type the network name"
+        elif self.menu_index == MENU_TOGGLE_BLE:
+            if not self.ble_status.installed:
+                self.status_line = "BLE: run the installer to add it"
+                return
+            self.status_line = "Working..."
+            self._spawn(self._toggle_ble)
         elif self.menu_index == MENU_EXIT:
             self.running = False
 
     def _activate_scan_row(self):
         index = self.scan_index
+        if index == self._scan_row_count() - 1:
+            self.running = False
+            return
         if index == 0:
             self._leave_scan()
             return
@@ -507,6 +534,7 @@ class ConnectWifiApp:
     def view(self) -> View:
         with self.lock:
             connecting = self.mode == MODE_CONNECTING
+            device = self.status_monitor.sample()
             return View(
                 mode=self.mode,
                 menu_index=self.menu_index,
@@ -520,7 +548,13 @@ class ConnectWifiApp:
                 ble_key=self.ble_status.key,
                 wifi_ssid=self.wifi_ssid,
                 wifi_ip=self.wifi_ip,
+                wifi_level=device.wifi_level,
+                battery=device.battery,
+                charging=device.charging,
                 keyboard_ready=self.keyboard_ready,
+                button_down=self._button_is_down,
+                hold_armed=(self._button_is_down
+                            and time.monotonic() - self._button_down_at >= LONG_PRESS_SEC),
                 password_known_secured=self.password_known_secured,
                 scan_index=self.scan_index,
                 scan_window=self.scan_window,
@@ -542,23 +576,82 @@ class ConnectWifiApp:
         image = self.screens.render(view)
         self.board.draw_image(0, 0, image.width, image.height, rgb565_bytes(image))
 
+    # ---------- RGB status light ----------
+
+    def _led_color(self) -> tuple[int, int, int]:
+        """Turn the decorative RGB LED into a readable Wi-Fi indicator."""
+        if not self._led_enabled:
+            return (0, 0, 0)
+        if self._button_is_down:
+            return (210, 225, 255)
+        if self.mode == MODE_RESULT:
+            return (35, 235, 95) if self.result_ok else (255, 38, 32)
+        if self.mode == MODE_CONNECTING or self.busy:
+            pulse = (85, 135, 210, 135)[int(time.time() * 4) % 4]
+            return (20, pulse, 255)
+        level = self.status_monitor.sample().wifi_level
+        if level is None:
+            level = 2 if self.wifi_ssid else 0
+        return LED_SIGNAL.get(max(0, min(3, level)), LED_SIGNAL[0])
+
+    def _update_led(self, force: bool = False) -> None:
+        setter = getattr(self.board, "set_rgb", None)
+        if setter is None:
+            return
+        base = self._led_color()
+        scale = self._led_brightness / 100.0
+        color = tuple(int(channel * scale) for channel in base)
+        if not force and color == self._last_led:
+            return
+        try:
+            setter(*color)
+            self._last_led = color
+        except Exception as exc:
+            # Losing the status light must never take down network setup.
+            if self._last_led is not False:
+                print(f"[connectwifi] RGB status light unavailable: {exc}", flush=True)
+            self._last_led = False
+
+    def _clear_led(self) -> None:
+        setter = getattr(self.board, "set_rgb", None)
+        if setter is not None:
+            try:
+                setter(0, 0, 0)
+            except Exception:
+                pass
+
     # ---------- main loop ----------
 
     def run(self):
-        self.probe()
-        if self.keyboard is not None:
-            self.keyboard.start(self.handle_key)
         try:
+            # Draw the real Wi-Fi page before any blocking radio/service reads.
+            # The launcher can hand over directly without an app splash screen.
+            self.busy = True
+            self.status_line = "Checking Wi-Fi..."
+            self.render(force=True)
+            self.status_monitor.start()
+            if self.keyboard is not None:
+                self.keyboard.start(self.handle_key)
+
+            def prepare():
+                self.probe()
+                self.poll_status()
+                with self.lock:
+                    self.status_line = ""
+            self._start_thread(lambda: self._run_worker(prepare))
             while self.running:
                 now = time.time()
-                if now - self._last_poll_at >= POLL_INTERVAL_SEC:
+                if not self.busy and now - self._last_poll_at >= POLL_INTERVAL_SEC:
                     self._last_poll_at = now
                     self.poll_status()
                 self.render()
+                self._update_led()
                 time.sleep(FRAME_INTERVAL_SEC)
         finally:
             if self.keyboard is not None:
                 self.keyboard.stop()
+            self.status_monitor.stop()
+            self._clear_led()
             self.board.cleanup()
 
 
@@ -566,3 +659,17 @@ def main():
     from connectwifi.board import create_board
 
     ConnectWifiApp(create_board(), keyboard=SdkKeyboardReader()).run()
+
+
+def _led_preferences() -> tuple[bool, int]:
+    """Honor MFruit OS's existing Light switch and brightness setting."""
+    home = (os.environ.get("MFRUIT_HOME") or os.environ.get("WHISPLAY_OS_HOME")
+            or os.path.expanduser("~/.whisplay-os"))
+    try:
+        with open(os.path.join(home, "config", "settings.json"), encoding="utf-8") as handle:
+            led = (json.load(handle).get("led") or {})
+        enabled = bool(led.get("enabled", True))
+        brightness = max(0, min(100, int(led.get("brightness", 30))))
+        return enabled, brightness
+    except (OSError, ValueError, TypeError):
+        return True, 30

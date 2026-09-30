@@ -127,7 +127,7 @@ def test_start_registers_listens_then_takes_the_screen(daemon, board):
                                      "framebuffer.acquire"]
     entry = daemon.requests[0]["payload"]
     assert entry["app_id"] == "connectwifi" and entry["launch_command"].endswith("/run.sh")
-    assert entry["disable_esc_exit_key"] is True and entry["exit_gesture"] == "quad_click"
+    assert entry["disable_esc_exit_key"] is True and entry["exit_gesture"] == "none"
     assert daemon.requests[0]["version"] == 1
 
 
@@ -186,6 +186,34 @@ def test_cleanup_hands_the_screen_back(daemon, board):
     board.cleanup()
     release = [req for req in daemon.requests if req["cmd"] == "app.focus.release"]
     assert release and release[0]["payload"] == {"app_id": "connectwifi", "session_token": "tok1"}
+
+
+@pytest.mark.parametrize("method, args, command, expected", [
+    ("set_rgb", (35, 215, 95), "led.set", {"r": 35, "g": 215, "b": 95}),
+    ("set_rgb_fade", (30, 150, 255, 200), "led.fade",
+     {"r": 30, "g": 150, "b": 255, "duration_ms": 200}),
+])
+def test_led_belongs_only_to_the_foreground_app(monkeypatch, method, args, command, expected):
+    client = DaemonBoard(registration())
+    sent = []
+    monkeypatch.setattr(client, "_request", lambda cmd, payload=None: sent.append((cmd, payload)))
+    set_color = getattr(client, method)
+
+    set_color(*args)                         # app has not taken the screen yet
+    assert sent == []
+    client._token = "foreground-token"
+    set_color(*args)
+    assert sent == [(command, expected)]
+
+    client.handle_event({"event": "app_focus_revoked", "payload": {"reason": "exit"}})
+    set_color(*args)                         # late render/cleanup cannot change the new app's LED
+    assert sent == [(command, expected)]
+
+    client._token = "new-foreground-token"
+    client.release_focus()
+    sent.clear()
+    set_color(*args)                         # voluntary Back has the same ownership rule
+    assert sent == []
 
 
 def test_without_daemon_or_driver_the_error_says_what_to_start(tmp_path, monkeypatch):

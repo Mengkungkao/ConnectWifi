@@ -4,14 +4,15 @@ Join a Wi-Fi network from the Whisplay HAT's screen on a Raspberry Pi or
 Orange Pi, with the HAT's button and a USB or Bluetooth keyboard. For a
 board with no keyboard, the app also switches PiSugar's Bluetooth LE
 setup service on and off, so a phone can send the network name and
-password instead.
+password instead. Its connection card, lists, status bar, battery and
+gesture hints use the same interface as MFruit OS Settings.
 
 It is a standalone, installable version of the *WiFi Config* app from
 Whisplay's `example/wifi_config_app.py`, with the fixes listed under
 [What changed](#what-changed-from-whisplays-wifi-config), and it replaces
 Whisplay's own Wi-Fi apps on the desktop, in the built-in WiFi's place.
 
-![Menu, BLE not installed, nearby networks, all networks, hidden network, password, connecting, connected, failed](docs/screens.png)
+![Wi-Fi, explicit Back rows, network list, phone setup, password, connecting and results](docs/screens.png)
 
 ## Requirements
 
@@ -22,7 +23,7 @@ Whisplay's own Wi-Fi apps on the desktop, in the built-in WiFi's place.
   HAT's screen and button, so the app needs it, and nothing else from
   Whisplay: see [Standalone](#standalone).
 - NetworkManager managing the Wi-Fi interface (the default on both OSes).
-- Python 3.9+, Pillow, NumPy (the installer offers to apt-install them).
+- Python 3.9+ and Pillow (the installer offers to apt-install it).
 
 ## Install
 
@@ -56,7 +57,7 @@ steps that need it, and asks before each change. Options, for either board:
 
 ### What the installer does
 
-1. Checks the board, and installs `python3-pil python3-numpy fonts-dejavu-core bluez curl rfkill` if missing.
+1. Checks the board, and installs `python3-pil fonts-dejavu-core bluez curl rfkill` if missing.
 2. Checks `whisplay-daemon` is running and answering on its socket.
 3. Checks the radios. **Raspberry Pi:** `dtoverlay=disable-wifi/disable-bt` in `config.txt`, and the Wi-Fi country. **Orange Pi:** rfkill, the vendor Bluetooth service (`sprd-bluetooth`/`aw859a-bluetooth`), `bluetooth.service`.
 4. Makes sure the app may scan and connect from under `whisplay-daemon`, outside any login session: your user in `netdev`, and, only if NetworkManager would refuse, a polkit grant for `netdev`. Polkit before 0.106 (Ubuntu 22.04 on the Orange Pi) gets a `.pkla` file, newer polkit a JavaScript rule. Then it keeps Wi-Fi up (see [Staying connected](#staying-connected)): it turns off Wi-Fi power saving where NetworkManager turns it on, and offers the `connectwifi-keepalive` service.
@@ -157,21 +158,26 @@ python3 -m connectwifi.keepalive --once       # one look, now
 
 ## Use
 
-Pick **Connect WiFi** on the HAT desktop (hold the button), or run `./run.sh`.
+In MFruit OS, open **Settings → Wi-Fi**. It opens this complete network
+manager directly and returns to Settings when you leave. You can also pick
+**Connect WiFi** on the daemon desktop, or run `./run.sh`.
 
 | Input | Menu and lists | Typing a name or password |
 |-------|----------------|---------------------------|
 | Button, short press | next row | - |
 | Button, hold 1 s | select | cancel |
-| Button, 4 quick presses | back to the desktop | back to the desktop |
+| Repeated short presses | move through rows, including Back | - |
 | Up / Down | move | - |
 | Enter | select | next / connect |
 | Esc | back (from the menu: leave) | back |
 | Backspace | - | delete |
 
-- **Scan networks** first shows what NetworkManager already has cached,
+- **Choose a network** first shows what NetworkManager already has cached,
   above 40% signal: instant, and the radio stays idle. *Rescan wider
   range* sweeps and lists everything. An empty first pass sweeps on its own.
+- **Back to Settings** is a row at the bottom of both Wi-Fi and Networks.
+  Tap to highlight it, then hold for one second and release to leave. Tapping
+  past it only wraps the selection; quick taps never trigger an exit shortcut.
 - **Type hidden network...** takes an SSID, then a password (blank for an
   open network).
 - A network joined before shows **saved** in the list. Selecting it joins
@@ -189,8 +195,13 @@ Pick **Connect WiFi** on the HAT desktop (hold the button), or run `./run.sh`.
 - Selecting the network already in use does nothing but say so. WPA
   passwords shorter than 8 characters are caught on the spot rather than
   after nmcli times out.
-- **Turn BLE on/off** starts or stops the Bluetooth setup service. The
-  card above shows the name to look for and the key to enter on the phone.
+- **Phone setup** starts or stops the Bluetooth setup service. While it is
+  selected, the card above shows the name to look for and the setup key on
+  separate lines.
+- The Whisplay RGB light acknowledges a held button in white, pulses blue
+  while scanning or connecting, reports weak/usable/strong Wi-Fi in
+  amber/blue/green, and reports a result in green or red. It follows MFruit
+  OS's **Settings → Light** switch and brightness when those settings exist.
 
 The app logs to `~/.whisplay-daemon/daemon-app.log`, starting with one
 line of what it may do, for example
@@ -224,6 +235,10 @@ line of what it may do, for example
   which re-seeds the example's entry, cannot overwrite it.
 - **Menu shows when BLE is not installed** instead of offering a switch
   that cannot work.
+- **MFruit OS interface and efficient drawing.** The separate status and
+  connection screens are now one Wi-Fi hub built from MFruit SDK components.
+  Its RGB565 conversion no longer imports NumPy, saving memory and startup
+  work on small boards.
 
 ## Troubleshooting
 

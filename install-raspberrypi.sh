@@ -37,7 +37,7 @@ esac
 
 # ------------------------------------------------------------ 2. packages
 step "System packages"
-install_packages python3-pil python3-numpy fonts-dejavu-core bluez curl rfkill
+install_packages python3-pil fonts-dejavu-core bluez curl rfkill
 
 # ------------------------------------------------------------ 3. whisplay
 step "Whisplay HAT"

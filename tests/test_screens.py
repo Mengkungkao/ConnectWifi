@@ -73,8 +73,14 @@ def test_scan_rows_frame_the_networks_with_fixed_rows():
     assert rows[0] == ("Back", "") and rows[1] == ("Type hidden network...", "")
     assert rows[2] == ("Home", "now") and rows[3][1] == "66% open"
     assert rows[4] == ("Office", "55% saved")
-    assert rows[-1] == ("Rescan wider range", "")
-    assert scan_rows(View(scan_wide=True))[-1] == ("Rescan", "")
+    assert rows[-2] == ("Rescan wider range", "")
+    assert rows[-1] == ("Back to Settings", "")
+    assert scan_rows(View(scan_wide=True))[-2] == ("Rescan", "")
+
+
+def test_navigation_hints_only_advertise_explicit_selection():
+    assert Screens._list_hints(View(), "select") == [("tap", "next"), ("hold", "select")]
+    assert Screens._list_hints(View(hold_armed=True), "back") == [("release", "to back")]
 
 
 def test_ble_menu_label():

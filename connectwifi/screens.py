@@ -1,17 +1,19 @@
-"""Drawing the 240x280 screen. Nothing here touches hardware: render()
-turns a View into a PIL image, so every screen can be drawn in tests."""
+"""MFruit OS-styled screens for the Wi-Fi manager.
+
+The connection workflow stays independent of drawing: ``render`` receives an
+immutable ``View`` and returns one Pillow image for the Whisplay framebuffer.
+"""
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
-try:
-    import numpy as np
-except Exception:
-    np = None
+from mfruit_sdk.status import Status
+from mfruit_sdk.ui import (Canvas, DARK, Row, draw_list, footer, message,
+                           status_bar, text_field, toast, to_rgb565)
+from mfruit_sdk.ui.theme import CONTENT_BOTTOM, CONTENT_TOP, MARGIN, SCREEN_W
 
 MODE_MENU = "menu"
 MODE_SCAN = "scan"
@@ -20,23 +22,23 @@ MODE_PASSWORD = "password"
 MODE_CONNECTING = "connecting"
 MODE_RESULT = "result"
 
-MENU_TOGGLE_BLE = 0
-MENU_SCAN = 1
-MENU_EXIT = 2
-MENU_COUNT = 3
+# The main page is the Wi-Fi section of Settings: common actions first, then
+# setup alternatives and a predictable way back to MFruit OS.
+MENU_SCAN = 0
+MENU_HIDDEN = 1
+MENU_TOGGLE_BLE = 2
+MENU_EXIT = 3
+MENU_COUNT = 4
 
-# Fixed rows around the scanned networks, in list order.
+# Fixed rows around the scanned networks, in list order. Hidden network stays
+# available here as well as on the main page so it is never hard to find.
 SCAN_LEADING = ("Back", "Type hidden network...")
-VISIBLE_SCAN_ROWS = 6
-
-MARGIN = 14
-TEXT_X = 24
+VISIBLE_SCAN_ROWS = 5
 
 
 @dataclass(frozen=True)
 class View:
-    """Everything a frame shows. Two equal Views draw the same frame, which
-    is how the app skips redrawing when nothing changed."""
+    """Everything a frame shows. Equal views produce equal frames."""
 
     mode: str = MODE_MENU
     menu_index: int = 0
@@ -50,7 +52,12 @@ class View:
     ble_key: str = ""
     wifi_ssid: str = ""
     wifi_ip: str = ""
+    wifi_level: int | None = None
+    battery: int | None = None
+    charging: bool = False
     keyboard_ready: bool = False
+    button_down: bool = False
+    hold_armed: bool = False
     password_known_secured: bool = False
     scan_index: int = 0
     scan_window: int = 0
@@ -60,57 +67,28 @@ class View:
     connect_ssid: str = ""
     result_ok: bool = False
     result_message: str = ""
-    # Drive the sweep animation and the elapsed counter while connecting.
     phase: int = 0
     elapsed: int = 0
 
 
-def load_font(size: int, bold: bool = False):
-    candidates = []
-    if bold:
-        candidates.append("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
-    candidates.append("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                continue
-    return ImageFont.load_default()
-
-
 def rgb565_bytes(image: Image.Image) -> bytes:
-    rgb = image.convert("RGB")
-    if np is not None:
-        pixels = np.asarray(rgb, dtype=np.uint16)
-        packed = (
-            ((pixels[:, :, 0] & 0xF8) << 8)
-            | ((pixels[:, :, 1] & 0xFC) << 3)
-            | (pixels[:, :, 2] >> 3)
-        )
-        return packed.astype(">u2").tobytes()
-    out = bytearray()
-    for y in range(rgb.height):
-        for x in range(rgb.width):
-            r, g, b = rgb.getpixel((x, y))
-            value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
-            out.append((value >> 8) & 0xFF)
-            out.append(value & 0xFF)
-    return bytes(out)
+    """Compatibility name used by the app and older integrations."""
+    return to_rgb565(image)
 
 
 def scan_rows(view: View) -> list[tuple[str, str]]:
-    """(label, meta) for every row of the scan list, in order."""
+    """Return the public label/meta representation of the network list."""
     rows = [(name, "") for name in SCAN_LEADING]
     for ssid, signal, active, is_open, saved in view.networks:
         if active:
             meta = "now"
         elif saved:
-            meta = f"{signal}% saved"     # joins without asking for the password
+            meta = f"{signal}% saved"
         else:
             meta = f"{signal}% open" if is_open else f"{signal}%"
         rows.append((ssid, meta))
     rows.append(("Rescan" if view.scan_wide else "Rescan wider range", ""))
+    rows.append(("Back to Settings", ""))
     return rows
 
 
@@ -121,243 +99,161 @@ def ble_menu_label(view: View) -> str:
 
 
 class Screens:
-    def __init__(self, width: int = 240, height: int = 280):
+    def __init__(self, width: int = 240, height: int = 280, theme=DARK):
         self.width = width
         self.height = height
-        self.title_font = load_font(20, bold=True)
-        self.body_font = load_font(15)
-        self.row_font = load_font(14)
-        self.small_font = load_font(12)
+        self.theme = theme
 
     def render(self, view: View) -> Image.Image:
-        width, height = self.width, self.height
-        image = Image.new("RGB", (width, height), (11, 16, 24))
-        draw = ImageDraw.Draw(image)
-
-        accent = (60, 190, 100) if view.ble_active else (90, 100, 115)
-        draw.rounded_rectangle((MARGIN, 10, width - MARGIN, 44), radius=12, fill=accent)
-        draw.text((TEXT_X, 18), "CONNECT WIFI", fill=(255, 255, 255), font=self.title_font)
+        c = Canvas(self.theme, size=(self.width, self.height))
+        device = Status(view.wifi_level, view.battery, view.charging)
+        dot = self._state_color(c, view)
 
         if view.mode == MODE_MENU:
-            self._menu(draw, view)
+            self._menu(c, view, device, dot)
         elif view.mode == MODE_SCAN:
-            self._scan(draw, view)
+            self._scan(c, view, device, dot)
         elif view.mode == MODE_CONNECTING:
-            self._connecting(draw, view)
+            self._connecting(c, view, device)
         elif view.mode == MODE_RESULT:
-            self._result(draw, view)
+            self._result(c, view, device)
         else:
-            self._entry(draw, view)
+            self._entry(c, view, device)
+        return c.image
 
-        self._footer(draw, view)
-        return image
+    @staticmethod
+    def _state_color(c: Canvas, view: View):
+        if view.busy:
+            return c.theme.accent
+        if view.wifi_ssid:
+            return c.theme.success
+        return c.theme.warning
 
-    # ---------- helpers ----------
+    def _menu(self, c: Canvas, view: View, device: Status, dot) -> None:
+        t = c.theme
+        status_bar(c, "Wi-Fi", device, dot=dot)
 
-    def _fit(self, draw, text: str, font, max_width: float) -> str:
-        if draw.textlength(text, font=font) <= max_width:
-            return text
-        while text and draw.textlength(text + "...", font=font) > max_width:
-            text = text[:-1]
-        return text + "..."
+        # A compact connection card replaces the separate MFruit status page.
+        c.rounded((MARGIN - 4, CONTENT_TOP, SCREEN_W - MARGIN + 4, 96), 12,
+                  fill=t.surface)
+        connected = bool(view.wifi_ssid)
+        phone_selected = view.menu_index == MENU_TOGGLE_BLE and view.ble_installed
+        heading = ("PHONE SETUP ON" if view.ble_active else "PHONE SETUP OFF") if phone_selected else (
+            "CONNECTED" if connected else "NOT CONNECTED")
+        title = view.ble_name or "Phone setup" if phone_selected else (
+            view.wifi_ssid or "Choose a network below")
+        c.text(MARGIN + 6, 42, heading, 11,
+               "bold", t.accent if phone_selected else t.success if connected else t.warning)
+        c.text(MARGIN + 6, 58, title, 16,
+               "semibold", t.text, max_width=SCREEN_W - 2 * MARGIN - 12)
+        detail = view.wifi_ip or ("No IP address" if connected else "Wi-Fi is available")
+        if phone_selected:
+            detail = f"Key: {view.ble_key}" if view.ble_key else "No setup key configured"
+        c.text(MARGIN + 6, 78, detail, 12, "regular", t.text_muted,
+               max_width=SCREEN_W - 2 * MARGIN - 12)
 
-    def _wrap(self, draw, text: str, font, max_width: float, max_lines: int) -> list[str]:
-        lines, current = [], ""
-        for word in text.split():
-            candidate = f"{current} {word}".strip()
-            if current and draw.textlength(candidate, font=font) > max_width:
-                lines.append(current)
-                current = word
-                if len(lines) == max_lines:
-                    break
-            else:
-                current = candidate
-        if current and len(lines) < max_lines:
-            lines.append(current)
-        return [self._fit(draw, line, font, max_width) for line in lines]
-
-    def _row(self, draw, y: int, label: str, meta: str, selected: bool, dim: bool = False,
-             meta_color=None):
-        width = self.width
-        if selected:
-            draw.rounded_rectangle((MARGIN, y, width - MARGIN, y + 26), radius=8, fill=(38, 62, 92))
-        meta_width = draw.textlength(meta, font=self.small_font) if meta else 0
-        meta_x = width - TEXT_X - meta_width
-        draw.text(
-            (TEXT_X, y + 6),
-            self._fit(draw, label, self.row_font, meta_x - TEXT_X - 8),
-            fill=(255, 255, 255) if selected else ((150, 166, 184) if dim else (170, 186, 204)),
-            font=self.row_font,
-        )
-        if meta:
-            draw.text((meta_x, y + 9), meta,
-                      fill=meta_color or ((140, 190, 240) if selected else (100, 116, 134)),
-                      font=self.small_font)
-
-    # ---------- screens ----------
-
-    def _menu(self, draw, view: View):
-        width = self.width
-        text_width = width - 2 * TEXT_X
-        draw.rounded_rectangle((MARGIN, 52, width - MARGIN, 142), radius=12, fill=(20, 28, 40))
+        phone_detail = "On · hold to stop" if view.ble_active else "Off · hold to start"
+        rows = [
+            Row("Choose a network", kind="nav"),
+            Row("Hidden network", kind="nav"),
+            Row("Phone setup", subtitle=phone_detail, value=view.ble_active, kind="toggle",
+                enabled=view.ble_installed),
+            Row("Back to Settings", kind="back"),
+        ]
+        # Keep an unavailable service explanatory instead of showing a false toggle.
         if not view.ble_installed:
-            title, color = "NO BLE", (150, 166, 184)
-        elif view.ble_active:
-            title, color = "BLE ON", (120, 230, 150)
-        else:
-            title, color = "BLE OFF", (200, 90, 90)
-        draw.text((TEXT_X, 58), title, fill=color, font=self.title_font)
-        # Fixed line count keeps the card from resizing when the IP appears.
-        details = [
-            f"Name: {view.ble_name if view.ble_installed else 'not installed'}",
-            f"Key:  {view.ble_key if view.ble_installed else '-'}",
-            f"WiFi: {view.wifi_ssid or 'not connected'}",
-            f"IP:   {view.wifi_ip or '-'}",
-        ]
-        y = 84
-        for line in details:
-            draw.text((TEXT_X, y), self._fit(draw, line, self.small_font, text_width),
-                      fill=(214, 225, 236), font=self.small_font)
-            y += 14
+            rows[2] = Row("Phone setup", subtitle="Run the installer to add it",
+                          value="Unavailable", kind="info", tone="muted")
+        draw_list(c, rows, view.menu_index, top=100, bottom=CONTENT_BOTTOM)
+        action = "back" if view.menu_index == MENU_EXIT else "select"
+        footer(c, self._list_hints(view, action))
+        if view.status:
+            toast(c, view.status, "warning" if "failed" in view.status.lower() else "")
 
-        items = [
-            (ble_menu_label(view), ""),
-            ("Scan networks", "kbd" if view.keyboard_ready else "no kbd"),
-            ("Back to desktop", ""),
-        ]
-        y = 150
-        for index, (label, meta) in enumerate(items):
-            self._row(draw, y, label, meta, index == view.menu_index)
-            y += 28
-
-    def _scan(self, draw, view: View):
-        width = self.width
-        rows = scan_rows(view)
-        lead_count = len(SCAN_LEADING)
-        last_network = lead_count + len(view.networks) - 1
-
-        draw.text((TEXT_X, 50), "All networks" if view.scan_wide else "Nearby",
-                  fill=(130, 180, 230), font=self.small_font)
-        counter = f"{view.scan_index + 1}/{len(rows)}"
-        draw.text((width - TEXT_X - draw.textlength(counter, font=self.small_font), 50),
-                  counter, fill=(100, 116, 134), font=self.small_font)
-
-        y = 66
-        for offset in range(VISIBLE_SCAN_ROWS):
-            index = view.scan_window + offset
-            if index >= len(rows):
-                break
-            label, meta = rows[index]
-            is_action = index < lead_count or index > last_network
-            self._row(draw, y, label, meta, index == view.scan_index, dim=is_action,
-                      meta_color=(120, 230, 150) if meta == "now" else None)
-            y += 28
-            # Rules fence the network list off from the fixed rows.
-            if view.networks and index in (lead_count - 1, last_network):
-                draw.line((MARGIN, y + 2, width - MARGIN, y + 2), fill=(48, 62, 80), width=1)
-                y += 4
-
-    def _connecting(self, draw, view: View):
-        width = self.width
-        text_width = width - 2 * TEXT_X
-        draw.text((TEXT_X, 62), "Connecting", fill=(120, 200, 255), font=self.title_font)
-        draw.text((TEXT_X, 94), self._fit(draw, view.connect_ssid or "network", self.body_font, text_width),
-                  fill=(255, 255, 255), font=self.body_font)
-
-        track_top, track_height = 130, 10
-        span = width - 2 * MARGIN
-        draw.rounded_rectangle((MARGIN, track_top, width - MARGIN, track_top + track_height),
-                               radius=5, fill=(24, 34, 48))
-        segment = span // 3
-        travel = (view.phase / 24.0) * (span + segment) - segment
-        left = MARGIN + max(0, travel)
-        right = MARGIN + min(span, travel + segment)
-        if right > left:
-            draw.rounded_rectangle((left, track_top, right, track_top + track_height),
-                                   radius=5, fill=(60, 190, 100))
-
-        draw.text((TEXT_X, 156), f"{view.elapsed}s elapsed", fill=(150, 166, 184), font=self.small_font)
-        y = 178
-        for line in ("Asking NetworkManager to join", "this network. This can take a", "few seconds."):
-            draw.text((TEXT_X, y), line, fill=(118, 136, 156), font=self.small_font)
-            y += 16
-
-    def _result(self, draw, view: View):
-        width = self.width
-        text_width = width - 2 * TEXT_X
-        ok = view.result_ok
-        draw.rounded_rectangle((MARGIN, 56, width - MARGIN, 122), radius=12,
-                               fill=(18, 40, 28) if ok else (44, 22, 26))
-        draw.text((TEXT_X, 64), "Connected" if ok else "Not connected",
-                  fill=(120, 230, 150) if ok else (240, 120, 120), font=self.title_font)
-        draw.text((TEXT_X, 96), self._fit(draw, view.connect_ssid or "", self.body_font, text_width),
-                  fill=(214, 225, 236), font=self.body_font)
-
-        y = 136
-        for line in self._wrap(draw, view.result_message, self.small_font, text_width, 5):
-            draw.text((TEXT_X, y), line, fill=(150, 166, 184), font=self.small_font)
-            y += 16
-
-    def _entry(self, draw, view: View):
-        width = self.width
-        entering_ssid = view.mode == MODE_SSID
-        text_width = width - 2 * TEXT_X
-
-        draw.text((TEXT_X, 52), "Hidden network" if entering_ssid else "Password",
-                  fill=(130, 180, 230), font=self.small_font)
-        chip = "kbd" if view.keyboard_ready else "no kbd"
-        draw.text((width - TEXT_X - draw.textlength(chip, font=self.small_font), 52), chip,
-                  fill=(120, 230, 150) if view.keyboard_ready else (255, 180, 90),
-                  font=self.small_font)
-
-        draw.rounded_rectangle((MARGIN, 70, width - MARGIN, 118), radius=12, fill=(18, 28, 42))
-        draw.text((TEXT_X, 76), "SSID" if entering_ssid else "Password",
-                  fill=(255, 255, 255), font=self.small_font)
-        if entering_ssid:
-            typed = bool(view.ssid)
-            value = view.ssid[-22:] if typed else "<empty>"
-        else:
-            typed = view.password_len > 0
-            value = "*" * min(view.password_len, 22) if typed else (
-                "<empty>" if view.password_known_secured else "<open network>"
-            )
-        draw.text((TEXT_X, 92), value, fill=(120, 255, 140) if typed else (110, 124, 140),
-                  font=self.body_font)
-
-        if not entering_ssid and view.ssid:
-            draw.text((TEXT_X, 124), self._fit(draw, f"for {view.ssid}", self.small_font, text_width),
-                      fill=(150, 166, 184), font=self.small_font)
-
-        draw.line((MARGIN, 144, width - MARGIN, 144), fill=(48, 62, 80), width=1)
-        guide = [
-            ("Enter", "next" if entering_ssid else "connect"),
-            ("Esc", "back"),
-            ("Backspace", "delete"),
-            ("Hold button", "cancel"),
-        ]
-        y = 154
-        for name, meaning in guide:
-            draw.text((TEXT_X, y), name, fill=(214, 225, 236), font=self.small_font)
-            draw.text((TEXT_X + 92, y), meaning, fill=(118, 136, 156), font=self.small_font)
-            y += 18
-
-    def _footer(self, draw, view: View):
-        """The quad-click exit gesture stays live in the daemon; it just does
-        not take up a line on screen."""
-        width, height = self.width, self.height
-        top = height - 36
-        draw.line((MARGIN, top, width - MARGIN, top), fill=(48, 62, 80), width=1)
-        footer = view.status
-        if not footer:
-            if view.mode == MODE_CONNECTING:
-                footer = "Please wait"
-            elif view.mode == MODE_RESULT:
-                footer = "Press to continue"
-            elif view.busy:
-                footer = "working..."
-            elif view.mode in (MODE_MENU, MODE_SCAN):
-                footer = "Press: next   Hold: select"
+    def _scan(self, c: Canvas, view: View, device: Status, dot) -> None:
+        t = c.theme
+        badge = ("SCAN", t.accent) if view.busy else None
+        status_bar(c, "Networks", device, badge=badge, dot=dot)
+        if view.status:
+            c.text(MARGIN + 2, 43, view.status, 12, "medium", t.text_muted,
+                   max_width=SCREEN_W - 2 * MARGIN - 4)
+        rows = [Row("Back", kind="back"), Row("Hidden network", kind="nav")]
+        for ssid, signal, active, is_open, saved in view.networks:
+            if active:
+                subtitle, tone = "Connected", "success"
+            elif saved:
+                subtitle, tone = "Saved", ""
+            elif is_open:
+                subtitle, tone = "Open network", "warning"
             else:
-                footer = "Type on the USB keyboard"
-        draw.text((TEXT_X, top + 10), self._fit(draw, footer, self.small_font, width - 2 * TEXT_X),
-                  fill=(156, 214, 255), font=self.small_font)
+                subtitle, tone = "Password required", ""
+            rows.append(Row(ssid, subtitle=subtitle, value=f"{signal}%", kind="nav", tone=tone))
+        rows.append(Row("Rescan" if view.scan_wide else "Rescan wider range", kind="action"))
+        rows.append(Row("Back to Settings", kind="back"))
+        draw_list(c, rows, view.scan_index, top=58 if view.status else CONTENT_TOP,
+                  bottom=CONTENT_BOTTOM)
+        action = "back" if view.scan_index in (0, len(rows) - 1) else "select"
+        footer(c, self._list_hints(view, action))
+
+    @staticmethod
+    def _list_hints(view: View, action: str) -> list:
+        if view.busy:
+            return [("wait", "working")]
+        if view.hold_armed:
+            return [("release", f"to {action}")]
+        return [("tap", "next"), ("hold", action)]
+
+    def _connecting(self, c: Canvas, view: View, device: Status) -> None:
+        t = c.theme
+        status_bar(c, "Wi-Fi", device, dot=t.accent)
+        message(c, "Connecting", view.connect_ssid or "Network", tone="accent",
+                top=CONTENT_TOP, bottom=190)
+        left, right, y = MARGIN, SCREEN_W - MARGIN, 181
+        c.rounded((left, y, right, y + 8), 4, fill=t.surface_hi)
+        segment = max(28, (right - left) // 3)
+        travel = (view.phase / 24.0) * ((right - left) + segment) - segment
+        x0, x1 = left + max(0, travel), left + min(right - left, travel + segment)
+        if x1 > x0:
+            c.rounded((x0, y, x1, y + 8), 4, fill=t.accent)
+        c.text(SCREEN_W // 2, 204, f"{view.elapsed}s elapsed", 12, "regular",
+               t.text_muted, anchor="ma")
+        footer(c, [("wait", "NetworkManager is joining")])
+
+    def _result(self, c: Canvas, view: View, device: Status) -> None:
+        t = c.theme
+        tone = "success" if view.result_ok else "error"
+        status_bar(c, "Wi-Fi", device, dot=t.success if view.result_ok else t.error)
+        message(c, "Connected" if view.result_ok else "Could not connect",
+                self._result_body(view), tone=tone)
+        footer(c, [("tap", "continue")])
+
+    @staticmethod
+    def _result_body(view: View) -> str:
+        parts = [part for part in (view.connect_ssid, view.result_message) if part]
+        return "\n".join(parts)
+
+    def _entry(self, c: Canvas, view: View, device: Status) -> None:
+        t = c.theme
+        entering_ssid = view.mode == MODE_SSID
+        title = "Hidden network" if entering_ssid else "Password"
+        status_bar(c, title, device, dot=t.warning, title_sizes=(17, 15, 13))
+        c.text(MARGIN, 54, "Network name" if entering_ssid else f"For {view.ssid}",
+               13, "medium", t.text_muted, max_width=SCREEN_W - 2 * MARGIN)
+        if entering_ssid:
+            shown, placeholder = view.ssid, "Type the SSID"
+        else:
+            shown = "•" * min(view.password_len, 24)
+            placeholder = "Blank for an open network" if not view.password_known_secured else "Type password"
+        text_field(c, shown, 76, placeholder=placeholder)
+        if view.status:
+            warning = "cannot" in view.status.lower() or "needs" in view.status.lower()
+            c.text(MARGIN, 122, view.status, 12, "semibold",
+                   t.warning if warning else t.text_muted,
+                   max_width=SCREEN_W - 2 * MARGIN)
+        keyboard = "Keyboard ready" if view.keyboard_ready else "Connect a USB keyboard to type"
+        c.text(MARGIN, 157, keyboard, 13, "medium",
+               t.success if view.keyboard_ready else t.warning,
+               max_width=SCREEN_W - 2 * MARGIN)
+        c.text(MARGIN, 181, "Enter  continue", 12, "regular", t.text_muted)
+        c.text(MARGIN, 201, "Esc  back    Backspace  delete", 12, "regular", t.text_muted)
+        footer(c, [("hold", "cancel")])

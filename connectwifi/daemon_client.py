@@ -154,6 +154,24 @@ class DaemonBoard:
                 dst = (y + row) * self._stride + x * 2
                 fb[dst:dst + row_bytes] = pixel_data[src:src + row_bytes]
 
+    # ---------- RGB status light ----------
+
+    def set_rgb(self, r: int, g: int, b: int):
+        """Match WhisplayBoard's LED API while the daemon owns the HAT."""
+        with self._lock:
+            if self._token is None:
+                return  # focus was released or revoked; the next app owns the LED
+            self._request("led.set", {"r": _byte(r), "g": _byte(g), "b": _byte(b)})
+
+    def set_rgb_fade(self, r: int, g: int, b: int, duration_ms: int = 100):
+        with self._lock:
+            if self._token is None:
+                return
+            self._request("led.fade", {
+                "r": _byte(r), "g": _byte(g), "b": _byte(b),
+                "duration_ms": max(0, int(duration_ms)),
+            })
+
     # ---------- events ----------
 
     def on_button_press(self, callback):
@@ -210,3 +228,7 @@ class DaemonBoard:
             callback(payload)
         else:
             callback()
+
+
+def _byte(value: int) -> int:
+    return max(0, min(255, int(value)))
